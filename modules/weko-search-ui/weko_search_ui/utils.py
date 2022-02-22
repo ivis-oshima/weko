@@ -43,7 +43,7 @@ from celery.result import AsyncResult
 from celery.task.control import revoke
 from elasticsearch import ElasticsearchException
 from elasticsearch.exceptions import NotFoundError
-from flask import abort, current_app, request
+from flask import abort, current_app, has_request_context, request
 from flask_babelex import gettext as _
 from flask_login import current_user
 from invenio_db import db
@@ -69,6 +69,7 @@ from weko_admin.utils import get_redis_cache, reset_redis_cache
 from weko_authors.utils import check_email_existed
 from weko_deposit.api import WekoDeposit, WekoIndexer, WekoRecord
 from weko_deposit.pidstore import get_latest_version_id
+from weko_deposit.signals import item_created
 from weko_handle.api import Handle
 from weko_index_tree.utils import check_index_permissions, \
     check_restrict_doi_with_indexes
@@ -517,7 +518,7 @@ def check_import_items(file, is_change_identifier: bool, is_gakuninrdm=False):
 
         list_record = handle_check_exist_record(list_record)
         handle_item_title(list_record)
-        handle_check_date(list_record)
+        list_record = handle_check_date(list_record)
         handle_check_and_prepare_index_tree(list_record)
         handle_check_and_prepare_publish_status(list_record)
         handle_check_and_prepare_feedback_mail(list_record)
@@ -579,6 +580,28 @@ def unpackage_import_file(data_path: str, csv_file_name: str, force_new=False):
     return list_record
 
 
+def getEncode(filepath):
+    """
+    getEncode [summary]
+
+    [extended_summary]
+
+    Args:
+        filepath ([type]): [description]
+
+    Returns:
+        [type]: [description]
+    """
+    encs = "iso-2022-jp euc-jp shift_jis utf-8".split()
+    for enc in encs:
+        with open(filepath, encoding=enc) as fr:
+            try:
+                fr = fr.read()
+            except UnicodeDecodeError:
+                continue
+        return enc
+
+
 def read_stats_csv(csv_file_path: str, csv_file_name: str) -> dict:
     """Read importing CSV file.
 
@@ -600,12 +623,12 @@ def read_stats_csv(csv_file_path: str, csv_file_name: str) -> dict:
     check_item_type = {}
     item_path_not_existed = []
     schema = ''
-    with open(csv_file_path, 'r') as csvfile:
-        csv_reader = csv.reader(csvfile, delimiter=',')
+    current_app.logger.debug("csv_file_path:{}".format(csv_file_path))
+    enc = getEncode(csv_file_path)
+    with open(csv_file_path, 'r', newline="", encoding=enc) as csvfile:
+        csv_reader = csv.reader(csvfile, dialect='excel', delimiter=',')
         try:
             for num, data_row in enumerate(csv_reader, start=1):
-                # current_app.logger.debug(num)
-                # current_app.logger.debug(data_row)
                 if num == 1:
                     first_line_format_exception = Exception({
                         'error_msg': _('There is an error in the format of the'
@@ -1303,10 +1326,27 @@ def import_items_to_system(item: dict, request_info=None, is_gakuninrdm=False):
         # Push item to elasticsearch.
         push_item_to_elasticsearch(id, index, doc_type, data)
         # Save item to stats events.
-        save_item_to_stats_events(id, index, doc_type, data)
+        #save_item_to_stats_events(id, index, doc_type, data)
+        try:
+            if has_request_context():
+                if current_user:
+                    user_id = current_user.get_id()
+                else:
+                    user_id = -1
+                item_created.send(
+                    current_app._get_current_object(),
+                    user_id=user_id,
+                    item_id=item.get('id'),
+                    item_title=item.get('item_title')
+                )
+        except BaseException:
+            import traceback
+            current_app.logger.error(traceback.format_exc())
+            abort(500, 'MAPPING_ERROR')
 
     def prepare_stored_data(item, request_info):
         """Prepare stored data."""
+        # TODO: consider to use "weko_deposit.signals.item_created."
         timestamp = datetime.utcnow().replace(microsecond=0)
         doc = {
             'ip_address': request_info.get('remote_addr'),
@@ -2197,8 +2237,10 @@ def handle_check_date(list_record):
     :return
 
     """
+    result = []
     for record in list_record:
         errors = []
+        warnings = []
         date_iso_keys = []
         item_type = ItemTypes.get_by_id(id_=record.get(
             'item_type_id', 0), with_deleted=True)
@@ -2213,18 +2255,34 @@ def handle_check_date(list_record):
                 data_result = get_sub_item_value(attribute, _keys[-1])
                 for value in data_result:
                     if not validation_date_property(value):
-                        errors.append(
-                            _('Please specify the date with any format of'
-                              + ' YYYY-MM-DD, YYYY-MM, YYYY.'))
-                        break
-                if errors:
-                    break
+                        if re.match(r'\d{4}/\d{1,2}/\d{1,2}', value):
+                            _value = datetime.strptime(
+                                value, '%Y/%m/%d').strftime('%Y-%m-%d')
+                            attribute = json.loads((json.dumps(
+                                attribute)).replace(value, _value))
+                            record['metadata'][_keys[0]] = attribute
+                            warnings.append(
+                                _('Please specify the date with any format of'
+                                  + ' YYYY-MM-DD, YYYY-MM, YYYY.'))
+                            warnings.append(
+                                _('Replace value of {} from {} to {}.').format(key, value, _value))
+                        else:
+                            errors.append(
+                                _('Please specify the date with any format of'
+                                  + ' YYYY-MM-DD, YYYY-MM, YYYY.'))
         # validate pubdate
         try:
             pubdate = record.get('metadata').get('pubdate')
-            if pubdate and pubdate != datetime.strptime(pubdate, '%Y-%m-%d') \
-                    .strftime('%Y-%m-%d'):
+            if pubdate and re.match(r'\d{4}-\d{1,2}-\d{1,2}', pubdate):
+                pubdate = datetime.strptime(
+                    pubdate, '%Y-%m-%d').strftime('%Y-%m-%d')
+            elif pubdate and re.match(r'\d{4}/\d{1,2}/\d{1,2}', pubdate):
+                pubdate = datetime.strptime(
+                    pubdate, '%Y/%m/%d').strftime('%Y-%m-%d')
+            else:
                 raise Exception
+
+            record['metadata']['pubdate'] = pubdate
         except Exception:
             errors.append(_('Please specify PubDate with YYYY-MM-DD.'))
         # validate file open_date
@@ -2236,6 +2294,12 @@ def handle_check_date(list_record):
             record['errors'] = record['errors'] + errors \
                 if record.get('errors') else errors
             record['errors'] = list(set(record['errors']))
+        if warnings:
+            record['warnings'] = record['warnings'] + warnings \
+                if record.get('warnings') else warnings
+            record['warnings'] = list(set(record['warnings']))
+        result.append(record)
+    return result
 
 
 def get_data_in_deep_dict(search_key, _dict={}):
