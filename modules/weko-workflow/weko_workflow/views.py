@@ -2165,6 +2165,10 @@ def withdraw_confirm(activity_id='0', action_id=0):
                 activity_id,
                 identifier_actionid)
             identifier_handle = IdentifierHandle(item_id)
+            if not isinstance(identifier, dict) or "action_identifier_select" in identifier:
+                current_app.logger.error("withdraw_confirm: bad identifier data")
+                res = ResponseMessageSchema().load({"code":-1,"msg":"bad identifier data"})
+                return jsonify(res.data), 500
 
             if identifier_handle.delete_pidstore_doi():
                 identifier['action_identifier_select'] = \
@@ -2182,7 +2186,7 @@ def withdraw_confirm(activity_id='0', action_id=0):
                 except PIDDoesNotExistError:
                     current_app.logger.error("withdraw_confirm: can not get PersistentIdentifier")
                     res = ResponseMessageSchema().load({"code":-1,"msg":"can not get PersistentIdentifier"})
-                    return jsonify(res.data), 400
+                    return jsonify(res.data), 500
                 recid = get_record_identifier(current_pid.pid_value)
                 if recid is None:
                     pid_without_ver = get_record_without_version(
